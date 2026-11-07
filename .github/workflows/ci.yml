@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# ワークフローの権限は、コードを読むことだけにする（リポジトリの既定が変わっても広がらないように）
+permissions:
+  contents: read
+
+# PR に続けて push したときは、前の実行を止める。main への push は止めずに最後まで確かめる
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    # 手元の開発環境（macOS 26、Xcode 26）にそろえる
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: swift --version
+      - run: swift test
+      # アプリのバンドルまで作れることを確かめる
+      - run: ./scripts/build-app.sh
