@@ -23,12 +23,15 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
         static let skip = "SKIP"
         /// 初回の通知と再通知で同じ識別子を使い、通知が重ならないようにする
         static let request = "break-proposal"
+        static let breakOver = "break-over"
     }
 
     private let center = UNUserNotificationCenter.current()
     private(set) var authorization: NotificationAuthorization = .unknown
 
     var onAction: ((ProposalAction) -> Void)?
+    /// 提案の通知の本文がクリックされた。メニューバーのメニューを開き、選択肢を見せる
+    var onOpenChoices: (() -> Void)?
     var onAuthorizationChange: (() -> Void)?
 
     func setUp() {
@@ -78,7 +81,7 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
     func postProposal(isReminder: Bool, workMinutes: Int) {
         let content = UNMutableNotificationContent()
         content.title = isReminder ? "10分経ちました。休憩しませんか？" : "休憩しませんか？"
-        content.body = "最後の休憩から\(workMinutes)分作業しています。"
+        content.body = "最後の休憩から\(workMinutes)分作業しています。クリックすると選択肢を表示します。"
         content.categoryIdentifier = ID.category
         content.sound = .default
 
@@ -89,6 +92,23 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
                 NSLog("BreakTrigger: 通知を出せませんでした: \(error.localizedDescription)")
             } else {
                 NSLog("BreakTrigger: 通知を出しました（\(isReminder ? "再通知" : "初回")）")
+            }
+        }
+    }
+
+    func postBreakOver() {
+        let content = UNMutableNotificationContent()
+        content.title = "休憩が終わりました"
+        content.body = "作業を再開しましょう。"
+        content.sound = .default
+
+        center.removeDeliveredNotifications(withIdentifiers: [ID.breakOver])
+        let request = UNNotificationRequest(identifier: ID.breakOver, content: content, trigger: nil)
+        center.add(request) { error in
+            if let error {
+                NSLog("BreakTrigger: 通知を出せませんでした: \(error.localizedDescription)")
+            } else {
+                NSLog("BreakTrigger: 休憩の終わりを通知しました")
             }
         }
     }
@@ -118,15 +138,20 @@ final class NotificationController: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         let action: ProposalAction?
         switch response.actionIdentifier {
+        // 休憩の終わりの通知には選択肢がないため、何もしない
+        case _ where response.notification.request.identifier == ID.breakOver: action = nil
         case ID.takeBreak: action = .takeBreak
         case ID.snooze: action = .snooze
         // 通知を閉じた場合は、今回の提案を閉じる「今回はスキップ」として扱う
         case ID.skip, UNNotificationDismissActionIdentifier: action = .skip
-        // 本文のクリックでは何もしない（メニューバーから選べる）
         default: action = nil
         }
+        // 本文のクリックでは、メニューバーのメニューを開いて選択肢を見せる
+        let opensChoices = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            && response.notification.request.identifier == ID.request
         DispatchQueue.main.async { [weak self] in
             if let action { self?.onAction?(action) }
+            if opensChoices { self?.onOpenChoices?() }
             completionHandler()
         }
     }

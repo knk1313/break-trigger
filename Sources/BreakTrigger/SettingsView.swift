@@ -14,9 +14,9 @@ struct SettingsView: View {
         Form {
             Section("休憩の提案") {
                 Stepper(value: $store.settings.workMinutes, in: BreakSettings.workMinutesRange, step: 5) {
-                    Text("休憩を挟まずに \(store.settings.workMinutes) 分作業したら提案する")
+                    Text("画面がついてから \(store.settings.workMinutes) 分経ったら提案する")
                 }
-                Text("「10分後」を選んだときは、10分後にもう一度通知します。")
+                Text("「今休む」を選ぶと、10分後に休憩の終わりを通知します。「10分後」を選ぶと、10分後にもう一度提案します。画面が消えるか、画面をロックすると、作業時間をリセットします。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -42,7 +42,7 @@ struct SettingsView: View {
             }
 
             Section {
-                Text("設定はこのMacの中だけに保存します。キーボードとマウスは操作があったかどうかだけを使い、入力した内容は読み取りません。")
+                Text("設定はこのMacの中だけに保存します。キーボードとマウスは、通知を出す前に操作の切れ目を待つためだけに使い、入力した内容は読み取りません。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

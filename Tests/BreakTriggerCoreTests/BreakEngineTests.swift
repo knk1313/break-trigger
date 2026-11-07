@@ -40,10 +40,10 @@ final class Simulator {
         }
     }
 
-    func sleep() { record(engine.handleSleep(now: now)) }
-    func wake(after seconds: Int) {
+    func screenOff() { record(engine.handleScreenOff(now: now)) }
+    func screenOn(after seconds: Int) {
         now.addTimeInterval(TimeInterval(seconds))
-        record(engine.handleWake(now: now))
+        record(engine.handleScreenOn(now: now))
     }
     func takeBreak() { record(engine.takeBreak(now: now)) }
     func snooze() { record(engine.snooze(now: now)) }
@@ -54,6 +54,10 @@ final class Simulator {
             if case .postProposal(let isReminder) = item.event { return (item.at, isReminder) }
             return nil
         }
+    }
+
+    var breakOvers: [Date] {
+        events.compactMap { $0.event == .postBreakOver ? $0.at : nil }
     }
 
     func clearEvents() { events.removeAll() }
@@ -100,34 +104,57 @@ struct FirstProposalTests {
         #expect(sim.engine.phase == .working)
     }
 
-    @Test("5分未満の無操作は作業時間に含める")
-    func shortIdleCountsAsWork() {
+    @Test("操作がなくても、画面がついている間は作業時間に含める")
+    func idleCountsAsWork() {
         let sim = Simulator()
-        sim.work(20 * minute)
-        sim.pause(4 * minute + 59)
-        sim.work(26 * minute)
-        #expect(sim.engine.workDuration(at: sim.now) > 50 * 60)
-        sim.pause(3)
+        sim.work(10 * minute)
+        sim.pause(40 * minute)  // 長く手を止めても、画面がついていればリセットしない
+        #expect(sim.engine.phase == .proposed)
         #expect(sim.proposals.count == 1)
     }
 
-    @Test("5分の無操作で作業時間をリセットし、次の操作から計測を再開する")
-    func longIdleResets() {
+    @Test("画面が消えたら作業時間をリセットし、画面がついた時刻から計測を再開する")
+    func screenOffResets() {
         let sim = Simulator()
         sim.work(40 * minute)
-        sim.pause(5 * minute)
-        #expect(sim.engine.phase == .resting)
+        sim.screenOff()
+        #expect(sim.engine.phase == .screenOff)
         #expect(sim.engine.workDuration(at: sim.now) == 0)
 
-        sim.pause(10 * minute)  // 休憩が長引いても計測は始まらない
+        sim.pause(10 * minute)  // 画面が消えている間は計測しない
         #expect(sim.engine.workStart == nil)
 
-        sim.work(1)
+        sim.screenOn(after: 0)
         #expect(sim.engine.phase == .working)
         #expect(sim.engine.workStart == sim.now)
         sim.work(45 * minute)
         sim.pause(3)
         #expect(sim.proposals.isEmpty)  // リセット後はまだ45分
+        sim.work(5 * minute)
+        sim.pause(3)
+        #expect(sim.proposals.count == 1)
+    }
+
+    @Test("初回の通知待ちも、画面が消えたらリセットする")
+    func screenOffResetsDue() {
+        let sim = Simulator()
+        sim.work(55 * minute)
+        #expect(sim.engine.phase == .due)
+        sim.screenOff()
+        sim.screenOn(after: 60)
+        sim.work(1)
+        sim.pause(3)
+        #expect(sim.proposals.isEmpty)
+    }
+
+    @Test("画面が消えた状態で起動したら、画面がつくまで計測しない")
+    func startsWithScreenOff() {
+        let start = Date(timeIntervalSince1970: 0)
+        let engine = BreakEngine(settings: BreakSettings(), now: start, isScreenOn: false)
+        #expect(engine.phase == .screenOff)
+        #expect(engine.tick(now: start.addingTimeInterval(3600), idle: 3600).isEmpty)
+        _ = engine.handleScreenOn(now: start.addingTimeInterval(3600))
+        #expect(engine.workStart == start.addingTimeInterval(3600))
     }
 
     @Test("設定した作業時間で提案する")
@@ -150,16 +177,62 @@ struct ActionTests {
         return sim
     }
 
-    @Test("今休む：作業時間をリセットし、次の操作から計測を再開する")
+    @Test("今休む：10分後に休憩の終わりを知らせ、その時刻から作業時間を数え直す")
     func takeBreak() {
         let sim = proposed()
+        let selectedAt = sim.now
         sim.takeBreak()
         #expect(sim.events.map(\.event) == [.withdrawProposal])
-        #expect(sim.engine.phase == .resting)
-        sim.pause(30)
+        #expect(sim.engine.breakUntil == selectedAt.addingTimeInterval(600))
         #expect(sim.engine.workStart == nil)
+
+        sim.work(10 * minute - 1)  // 休憩中にPCを使っていても、休憩の扱いは変わらない
+        #expect(sim.breakOvers.isEmpty)
         sim.work(1)
+        #expect(sim.breakOvers == [selectedAt.addingTimeInterval(600)])
+        #expect(sim.engine.phase == .working)
         #expect(sim.engine.workStart == sim.now)
+
+        sim.work(50 * minute)
+        sim.pause(3)
+        #expect(sim.proposals.count == 1)
+        #expect(sim.breakOvers.count == 1)
+    }
+
+    @Test("休憩中に画面が消えても休憩の終わりを知らせ、計測は画面がついてから始める")
+    func breakWithScreenOff() {
+        let sim = proposed()
+        sim.takeBreak()
+        sim.screenOff()
+        #expect(sim.engine.breakUntil != nil)
+        sim.pause(10 * minute)
+        #expect(sim.breakOvers.count == 1)
+        #expect(sim.engine.phase == .screenOff)
+        sim.pause(5 * minute)
+        sim.screenOn(after: 0)
+        #expect(sim.engine.workStart == sim.now)
+    }
+
+    @Test("休憩中に画面が消えてまたついても、休憩はそのまま続く")
+    func breakSurvivesScreenToggle() {
+        let sim = proposed()
+        sim.takeBreak()
+        sim.pause(2 * minute)
+        sim.screenOff()
+        sim.screenOn(after: 3 * minute)
+        #expect(sim.engine.breakUntil != nil)
+        sim.pause(5 * minute)
+        #expect(sim.breakOvers.count == 1)
+        #expect(sim.engine.phase == .working)
+    }
+
+    @Test("休憩の終わりは、通知しない時間帯でも知らせる")
+    func breakOverIgnoresSchedule() {
+        let schedule = NotificationSchedule(limitHours: true, startMinute: 9 * 60, endMinute: 11 * 60)
+        let sim = proposed(BreakSettings(schedule: schedule), hour: 10, minute: 0)
+        sim.takeBreak()  // 10:50 に休憩、11:00 は対象外
+        sim.pause(10 * minute)
+        #expect(sim.breakOvers.count == 1)
     }
 
     @Test("10分後：操作が続いていても、選択からちょうど10分後に再通知する")
@@ -202,11 +275,42 @@ struct ActionTests {
         sim.work(60)
         #expect(sim.proposals.count == 1)
         #expect(sim.proposals[0].isReminder)
-        // 再通知の後も、次の選択まで重ねて通知しない
+        // 再通知の後も、10分経つまでは重ねて通知しない
         sim.pause(4 * minute)
-        sim.work(10 * minute)
+        sim.work(6 * minute - 10)
         sim.pause(3)
         #expect(sim.proposals.count == 1)
+    }
+
+    @Test("選ばれないまま放置されたら、10分ごとに再通知する")
+    func remindsWhenUnanswered() {
+        let sim = proposed()
+        let proposedAt = sim.now
+        sim.work(10 * minute - 1)
+        #expect(sim.proposals.isEmpty)
+        sim.work(1)
+        #expect(sim.proposals.count == 1)
+        #expect(sim.proposals[0].isReminder)
+        #expect(sim.proposals[0].at == proposedAt.addingTimeInterval(600))
+        #expect(sim.engine.phase == .proposed)
+
+        sim.pause(10 * minute)
+        #expect(sim.proposals.count == 2)
+
+        // 選べば、それ以降は放置の再通知を出さない
+        sim.takeBreak()
+        sim.pause(9 * minute)
+        #expect(sim.proposals.count == 2)
+    }
+
+    @Test("放置の再通知の時刻が通知しない時間帯なら、提案を取り下げて次の間隔を数える")
+    func unansweredOutsideSchedule() {
+        let schedule = NotificationSchedule(limitHours: true, startMinute: 9 * 60, endMinute: 11 * 60)
+        let sim = proposed(BreakSettings(schedule: schedule), hour: 10, minute: 5)  // 10:55 に提案、11:05 は対象外
+        sim.pause(10 * minute)
+        #expect(sim.proposals.isEmpty)
+        #expect(sim.events.map(\.event) == [.withdrawProposal])
+        #expect(sim.engine.phase == .working)
     }
 
     @Test("今回はスキップ：その時点から次の作業間隔を数える")
@@ -252,59 +356,36 @@ struct SnoozeCancellationTests {
         return sim
     }
 
-    @Test("5分の無操作で取り消す")
-    func cancelledByBreak() {
+    @Test("長く手を止めても取り消さない")
+    func notCancelledByIdle() {
         let sim = snoozed()
-        sim.pause(5 * minute)
-        #expect(sim.engine.phase == .resting)
-        #expect(sim.engine.snoozeUntil == nil)
-        #expect(sim.engine.lastCancellation == .breakTaken)
         sim.pause(10 * minute)
-        sim.work(10 * minute)
-        #expect(sim.proposals.isEmpty)
-    }
-
-    @Test("5分未満の無操作では取り消さない")
-    func notCancelledByShortIdle() {
-        let sim = snoozed()
-        sim.work(1)
-        sim.pause(4 * minute + 59)
-        sim.work(6 * minute)
         #expect(sim.proposals.count == 1)
     }
 
-    @Test("スリープで取り消し、復帰後は次の操作から計測を再開する")
-    func cancelledBySleep() {
+    @Test("画面が消えたら取り消し、画面がついたら計測を再開する")
+    func cancelledByScreenOff() {
         let sim = snoozed()
         sim.work(2 * minute)
-        sim.sleep()
-        #expect(sim.engine.phase == .resting)
-        #expect(sim.engine.lastCancellation == .sleep)
-        sim.wake(after: 30)
-        sim.work(1)
+        sim.screenOff()
+        #expect(sim.events.map(\.event) == [.withdrawProposal])
+        #expect(sim.engine.phase == .screenOff)
+        #expect(sim.engine.lastCancellation == .screenOff)
+        sim.screenOn(after: 30)
         #expect(sim.engine.workStart == sim.now)
         sim.work(10 * minute)
         #expect(sim.proposals.isEmpty)
     }
 
-    @Test("スリープの通知を取り逃しても、復帰で取り消す")
-    func cancelledByWakeAlone() {
-        let sim = snoozed()
-        sim.wake(after: 3600)
-        #expect(sim.engine.phase == .resting)
-        #expect(sim.engine.lastCancellation == .sleep)
-    }
-
-    @Test("スリープで初回の通知待ちもリセットする")
-    func sleepResetsDue() {
+    @Test("提案中に画面が消えたら、通知を取り下げる")
+    func proposalWithdrawnByScreenOff() {
         let sim = Simulator()
-        sim.work(55 * minute)
-        #expect(sim.engine.phase == .due)
-        sim.sleep()
-        sim.wake(after: 60)
-        sim.work(1)
+        sim.work(50 * minute)
         sim.pause(3)
-        #expect(sim.proposals.isEmpty)
+        sim.clearEvents()
+        sim.screenOff()
+        #expect(sim.events.map(\.event) == [.withdrawProposal])
+        #expect(sim.engine.lastCancellation == nil)
     }
 
     @Test("再通知の時刻が通知する時間帯の外なら、選択の時点で取り消す")

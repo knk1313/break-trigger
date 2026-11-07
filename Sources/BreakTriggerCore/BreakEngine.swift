@@ -2,45 +2,48 @@ import Foundation
 
 /// 休憩の提案の状態。
 public enum Phase: Equatable, Sendable {
-    /// 休憩中。次の操作から計測を始める
-    case resting
+    /// 画面が消えている。画面がついたら計測を始める
+    case screenOff
     /// 作業中。提案の時間にまだ達していない
     case working
     /// 提案の時間に達し、操作の切れ目を待っている
     case due
-    /// 通知を出し、選択を待っている
+    /// 通知を出し、選択を待っている。選ばれないまま「10分後」の長さが経つと、もう一度通知する
     case proposed
     /// 「10分後」が選ばれ、再通知を予約している
     case snoozed(until: Date)
+    /// 「今休む」が選ばれ、休憩の終わりを待っている
+    case onBreak(until: Date)
 }
 
 /// エンジンが通知の層に求める操作。
 public enum EngineEvent: Equatable, Sendable {
     case postProposal(isReminder: Bool)
     case withdrawProposal
+    /// 休憩の終わりを知らせる
+    case postBreakOver
 }
 
 /// 再通知の予約を取り消した理由。メニューに表示する。
 public enum SnoozeCancellation: Equatable, Sendable {
-    case breakTaken
-    case sleep
+    case screenOff
     case outsideSchedule
 }
 
 public struct EngineTiming: Sendable {
-    /// これ以上の無操作を休憩とみなす
-    public var breakIdle: TimeInterval
     /// 提案の時間に達した後、これ以上の無操作を「操作の切れ目」とみなす
     public var pauseIdle: TimeInterval
     /// 「10分後」の長さ
     public var snooze: TimeInterval
+    /// 「今休む」を選んだときの休憩の長さ
+    public var breakLength: TimeInterval
     /// 設定の1分を何秒として扱うか
     public var secondsPerMinute: TimeInterval
 
-    public init(breakIdle: TimeInterval = 300, pauseIdle: TimeInterval = 3, snooze: TimeInterval = 600, secondsPerMinute: TimeInterval = 60) {
-        self.breakIdle = breakIdle
+    public init(pauseIdle: TimeInterval = 3, snooze: TimeInterval = 600, breakLength: TimeInterval = 600, secondsPerMinute: TimeInterval = 60) {
         self.pauseIdle = pauseIdle
         self.snooze = snooze
+        self.breakLength = breakLength
         self.secondsPerMinute = secondsPerMinute
     }
 
@@ -48,36 +51,44 @@ public struct EngineTiming: Sendable {
     public static func scaled(by scale: Double) -> EngineTiming {
         let base = EngineTiming()
         return EngineTiming(
-            breakIdle: base.breakIdle / scale,
             pauseIdle: base.pauseIdle,
             snooze: base.snooze / scale,
+            breakLength: base.breakLength / scale,
             secondsPerMinute: base.secondsPerMinute / scale
         )
     }
 }
 
-/// 作業時間の計測と、休憩の提案・再通知の判定。
-/// 時刻と無操作の秒数を外から受け取るため、OSに依存せずに検査できる。
+/// 作業時間の計測と、休憩の提案・再通知・休憩の終わりの判定。
+/// 画面がついている間を作業時間として数える。
+/// 時刻、無操作の秒数、画面の状態を外から受け取るため、OSに依存せずに検査できる。
 public final class BreakEngine {
     public var settings: BreakSettings
     public let timing: EngineTiming
     public var calendar: Calendar
 
-    public private(set) var phase: Phase = .resting
-    /// 最後の休憩の後、最初に操作した時刻
+    public private(set) var phase: Phase
+    /// 作業時間を数え始めた時刻（画面がついた時刻か、休憩が終わった時刻）
     public private(set) var workStart: Date?
     /// 次の提案までの時間を数え始めた時刻。「今回はスキップ」で更新する
     public private(set) var intervalStart: Date?
     /// 直近に再通知の予約を取り消した理由
     public private(set) var lastCancellation: SnoozeCancellation?
-    /// この時刻より後の操作で、計測を再開する
-    private var restingSince: Date
+    /// 画面がついているか
+    public private(set) var isScreenOn: Bool
+    /// 直近に提案の通知を出した時刻。選ばれないまま放置されたときの再通知に使う
+    private var proposedAt: Date?
 
-    public init(settings: BreakSettings, timing: EngineTiming = EngineTiming(), calendar: Calendar = .current, now: Date) {
+    /// 画面がついた状態で始め、`now` から作業時間を数える。
+    public init(settings: BreakSettings, timing: EngineTiming = EngineTiming(), calendar: Calendar = .current, now: Date, isScreenOn: Bool = true) {
         self.settings = settings
         self.timing = timing
         self.calendar = calendar
-        self.restingSince = now
+        self.isScreenOn = isScreenOn
+        self.phase = .screenOff
+        if isScreenOn {
+            startWork(at: now)
+        }
     }
 
     public var snoozeUntil: Date? {
@@ -85,7 +96,12 @@ public final class BreakEngine {
         return nil
     }
 
-    /// 最後の休憩からの作業時間
+    public var breakUntil: Date? {
+        if case .onBreak(let until) = phase { return until }
+        return nil
+    }
+
+    /// 作業時間を数え始めてからの時間
     public func workDuration(at now: Date) -> TimeInterval {
         guard let workStart else { return 0 }
         return max(0, now.timeIntervalSince(workStart))
@@ -103,21 +119,27 @@ public final class BreakEngine {
 
     /// 1秒ごとに呼ぶ。`idle` は最後の操作からの秒数。
     public func tick(now: Date, idle: TimeInterval) -> [EngineEvent] {
-        if phase == .resting {
-            let lastInput = now.addingTimeInterval(-idle)
-            guard lastInput > restingSince, idle < timing.breakIdle else { return [] }
-            phase = .working
-            workStart = lastInput
-            intervalStart = lastInput
-        }
-
-        if idle >= timing.breakIdle {
-            return reset(at: now, reason: .breakTaken)
-        }
-
         switch phase {
-        case .resting, .proposed:
+        case .screenOff:
             return []
+        case .proposed:
+            // 通知はバナーだと数秒で消えるため、選ばれないまま放置されたら同じ間隔でもう一度知らせる
+            guard let proposedAt, now.timeIntervalSince(proposedAt) >= timing.snooze else { return [] }
+            guard allows(now) else {
+                restartInterval(at: now)
+                return [.withdrawProposal]
+            }
+            self.proposedAt = now
+            return [.postProposal(isReminder: true)]
+        case .onBreak(let until):
+            guard now >= until else { return [] }
+            // 休憩の終わりは、曜日や時間帯にかかわらず知らせる
+            if isScreenOn {
+                startWork(at: now)
+            } else {
+                endWork()
+            }
+            return [.postBreakOver]
         case .working:
             guard let intervalStart,
                   now.timeIntervalSince(intervalStart) >= proposalInterval,
@@ -135,6 +157,7 @@ public final class BreakEngine {
                 return []
             }
             phase = .proposed
+            proposedAt = now
             return [.postProposal(isReminder: true)]
         }
     }
@@ -147,32 +170,46 @@ public final class BreakEngine {
         }
         guard idle >= timing.pauseIdle else { return [] }
         phase = .proposed
+        proposedAt = now
         lastCancellation = nil
         return [.postProposal(isReminder: false)]
     }
 
-    // MARK: - スリープ
+    // MARK: - 画面
 
-    public func handleSleep(now: Date) -> [EngineEvent] {
-        reset(at: now, reason: .sleep)
+    /// 画面が消えた（ディスプレイのスリープ、画面のロック、Macのスリープ）。作業時間をリセットする。
+    /// 休憩中は、休憩の終わりの予定をそのまま残す。
+    public func handleScreenOff(now: Date) -> [EngineEvent] {
+        isScreenOn = false
+        if case .onBreak = phase { return [] }
+        let wasSnoozed = snoozeUntil != nil
+        let hadProposal = phase == .proposed || wasSnoozed
+        if wasSnoozed {
+            lastCancellation = .screenOff
+        }
+        endWork()
+        return hadProposal ? [.withdrawProposal] : []
     }
 
-    /// スリープの通知を受け取れなかった場合に備え、復帰でも区切る。
-    public func handleWake(now: Date) -> [EngineEvent] {
-        guard phase != .resting else {
-            restingSince = now
-            return []
+    /// 画面がついた。休憩中でなければ、この時刻から作業時間を数える。
+    public func handleScreenOn(now: Date) -> [EngineEvent] {
+        isScreenOn = true
+        if phase == .screenOff {
+            startWork(at: now)
         }
-        return reset(at: now, reason: .sleep)
+        return []
     }
 
     // MARK: - 通知の選択肢
 
-    /// 今休む
+    /// 今休む：休憩の長さの後に、休憩の終わりを知らせる
     public func takeBreak(now: Date) -> [EngineEvent] {
         guard phase == .proposed else { return [] }
         lastCancellation = nil
-        return reset(at: now, reason: nil)
+        phase = .onBreak(until: now.addingTimeInterval(timing.breakLength))
+        workStart = nil
+        intervalStart = nil
+        return [.withdrawProposal]
     }
 
     /// 10分後
@@ -199,21 +236,20 @@ public final class BreakEngine {
 
     // MARK: -
 
+    private func startWork(at now: Date) {
+        phase = .working
+        workStart = now
+        intervalStart = now
+    }
+
     private func restartInterval(at now: Date) {
         phase = .working
         intervalStart = now
     }
 
-    private func reset(at now: Date, reason: SnoozeCancellation?) -> [EngineEvent] {
-        let wasSnoozed = snoozeUntil != nil
-        let hadProposal = phase == .proposed || wasSnoozed
-        phase = .resting
+    private func endWork() {
+        phase = .screenOff
         workStart = nil
         intervalStart = nil
-        restingSince = now
-        if wasSnoozed, let reason {
-            lastCancellation = reason
-        }
-        return hadProposal ? [.withdrawProposal] : []
     }
 }
