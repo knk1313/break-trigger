@@ -82,9 +82,3 @@ BREAK_TRIGGER_TIME_SCALE=60 "build/Break Trigger.app/Contents/MacOS/BreakTrigger
 - `Sources/BreakTriggerCore/`：作業時間の計測と、通知・再通知・取り消し・休憩の終わりの判定。時刻、無操作の秒数、画面の状態を受け取るだけで、OSに依存しない
 - `Sources/BreakTrigger/`：メニューバー、通知、設定画面、操作と画面の状態の検知
 - `Tests/BreakTriggerCoreTests/`：時刻を1秒ずつ進めて、一連の操作をまねるテスト
-
-不具合の報告や変更の提案は、[CONTRIBUTING.md](CONTRIBUTING.md)を参照。
-
-## ライセンス
-
-[MIT License](LICENSE)
